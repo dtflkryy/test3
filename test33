@@ -1,0 +1,502 @@
+--[[
+    SCRIPT HUB AUTO FARM (DEMO CẤU TRÚC) - Luau / Mobile Executor
+    Mục đích: nghiên cứu cấu trúc UI + thuật toán logic.
+    Mọi thứ phụ thuộc game đều nằm ở khu vực [PLACEHOLDER].
+    Chạy lại script sẽ tự dọn phiên bản cũ (không bị nhân đôi UI / loop).
+]]
+
+-- ===================== SERVICES =====================
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser       = game:GetService("VirtualUser")
+local Workspace         = game:GetService("Workspace")
+local Lighting          = game:GetService("Lighting")
+local LocalPlayer       = Players.LocalPlayer
+
+-- Dọn phiên bản cũ nếu chạy lại
+if getgenv().HubCleanup then pcall(getgenv().HubCleanup) end
+
+local Destroyed   = false
+local Connections = {}
+local function Track(conn) table.insert(Connections, conn) return conn end
+
+-- ===================== CONFIG =====================
+getgenv().Config = getgenv().Config or {}
+local Defaults = {
+    AutoFarm = false, BringMobs = false, AutoQuest = false, FastAttack = false,
+    Noclip = false, AntiAFK = true,
+    TweenSpeed = 250,    -- studs/giây (một số game kick nếu quá cao)
+    AttackDelay = 0.15,  -- giây giữa mỗi lần FastAttack
+    AttackRange = 60,    -- tầm đánh
+    FarmHeight = 10,     -- độ cao đứng so với mặt đất bãi quái
+    BringRadius = 200,   -- bán kính gom quái quanh người chơi
+    BringForward = 6,    -- khoảng cách điểm gom phía trước nhân vật
+    WeaponName = "",     -- để trống = tự lấy Tool đầu tiên trong Backpack
+}
+for k, v in pairs(Defaults) do
+    if getgenv().Config[k] == nil then getgenv().Config[k] = v end
+end
+local Config = getgenv().Config
+
+-- ===================== [PLACEHOLDER] REMOTE =====================
+-- Đường dẫn bắt đầu từ ReplicatedStorage. SỬA THEO GAME CỦA BẠN.
+local RemotePaths = {
+    Attack     = {"Remotes", "Attack"},      -- PLACEHOLDER: RemoteEvent đánh
+    StartQuest = {"Remotes", "StartQuest"},  -- PLACEHOLDER: nhận quest
+    TravelSea  = {"Remotes", "TravelSea"},   -- PLACEHOLDER: chuyển Sea (chưa dùng)
+}
+local RemoteCache, WarnedRemote = {}, {}
+
+local function GetRemote(key)
+    local cached = RemoteCache[key]
+    if cached and cached.Parent then return cached end
+    local node = ReplicatedStorage
+    for _, name in ipairs(RemotePaths[key]) do
+        node = node and node:FindFirstChild(name)
+    end
+    if node then RemoteCache[key] = node return node end
+    if not WarnedRemote[key] then
+        WarnedRemote[key] = true
+        warn("[Hub] Chưa có remote placeholder: " .. key)
+    end
+    return nil
+end
+
+local function FireRemote(key, ...)
+    local r = GetRemote(key)
+    if not r then return false end
+    if r:IsA("RemoteEvent") then
+        r:FireServer(...)
+        return true
+    elseif r:IsA("RemoteFunction") then
+        task.spawn(function(...) pcall(r.InvokeServer, r, ...) end, ...) -- tránh block loop
+        return true
+    end
+    return false
+end
+
+-- ===================== DỮ LIỆU MẪU =====================
+-- Toàn bộ tên/tọa độ bên dưới là DỮ LIỆU MẪU, thay bằng dữ liệu thật.
+local QuestData = {
+    [1] = {
+        {MinLevel = 1,  MaxLevel = 9,  QuestName = "S1_Quest1", QuestIndex = 1, MobName = "Bandit",  NPCPos = CFrame.new(1060, 16, 1547),  MobPos = CFrame.new(1038, 16, 1576)},
+        {MinLevel = 10, MaxLevel = 29, QuestName = "S1_Quest2", QuestIndex = 1, MobName = "Monkey",  NPCPos = CFrame.new(-1600, 36, 150),  MobPos = CFrame.new(-1448, 22, 105)},
+        {MinLevel = 30, MaxLevel = 699,QuestName = "S1_Quest3", QuestIndex = 1, MobName = "Pirate",  NPCPos = CFrame.new(-1140, 5, 3830),  MobPos = CFrame.new(-1200, 5, 3900)},
+    },
+    [2] = {
+        {MinLevel = 700,  MaxLevel = 949,  QuestName = "S2_Quest1", QuestIndex = 1, MobName = "Raider",  NPCPos = CFrame.new(-420, 73, 1830), MobPos = CFrame.new(-500, 73, 1900)},
+        {MinLevel = 950,  MaxLevel = 1499, QuestName = "S2_Quest2", QuestIndex = 1, MobName = "Swan Pirate", NPCPos = CFrame.new(630, 73, 920), MobPos = CFrame.new(700, 73, 960)},
+    },
+    [3] = {
+        {MinLevel = 1500, MaxLevel = 1799, QuestName = "S3_Quest1", QuestIndex = 1, MobName = "Pirate Millionaire", NPCPos = CFrame.new(-290, 43, 5580), MobPos = CFrame.new(-350, 43, 5650)},
+        {MinLevel = 1800, MaxLevel = 2550, QuestName = "S3_Quest2", QuestIndex = 1, MobName = "Dragon Crew",        NPCPos = CFrame.new(5740, 610, -280), MobPos = CFrame.new(5800, 610, -330)},
+    },
+}
+
+local Locations = { -- cho tab Teleport (mẫu)
+    [1] = {{Name = "Starter Island", Pos = CFrame.new(1040, 16, 1550)}, {Name = "Jungle", Pos = CFrame.new(-1600, 36, 150)}},
+    [2] = {{Name = "Kingdom", Pos = CFrame.new(-420, 73, 1830)}, {Name = "Green Zone", Pos = CFrame.new(-2400, 73, -3200)}},
+    [3] = {{Name = "Port Town", Pos = CFrame.new(-290, 43, 5580)}, {Name = "Hydra Island", Pos = CFrame.new(5740, 610, -280)}},
+}
+
+-- ===================== [PLACEHOLDER] HOOKS =====================
+-- Mọi thứ đặc thù của game nằm ở đây. Hub chỉ gọi qua các hàm này.
+local SeaPlaceIds = { -- PLACEHOLDER: PlaceId -> Sea
+    [1111111111] = 1, [2222222222] = 2, [3333333333] = 3,
+}
+
+local Hooks = {}
+
+function Hooks.GetEnemiesFolder() -- PLACEHOLDER: folder chứa quái
+    return Workspace:FindFirstChild("Enemies")
+end
+
+function Hooks.GetLevel() -- PLACEHOLDER: nơi game lưu Level
+    local data = LocalPlayer:FindFirstChild("Data")
+    local lv = data and data:FindFirstChild("Level")
+    return lv and lv.Value or 1
+end
+
+function Hooks.GetSea()
+    return SeaPlaceIds[game.PlaceId] or 1 -- không khớp PlaceId thì mặc định Sea 1
+end
+
+function Hooks.HasActiveQuest(entry) -- PLACEHOLDER: kiểm tra quest ĐÚNG entry đang active
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local main = gui and gui:FindFirstChild("Main")
+    local quest = main and main:FindFirstChild("Quest")
+    -- Ví dụ: có thể so thêm tên quest trong GUI với entry.QuestName
+    return quest ~= nil and quest.Visible
+end
+
+function Hooks.StartQuest(entry) -- PLACEHOLDER: đổi đối số theo remote thật
+    return FireRemote("StartQuest", entry.QuestName, entry.QuestIndex)
+end
+
+function Hooks.FastAttack(targets) -- PLACEHOLDER: đổi đối số theo remote thật
+    local roots = {}
+    for _, t in ipairs(targets) do table.insert(roots, t.Root) end
+    if not FireRemote("Attack", roots) then
+        Hooks.BasicAttack() -- remote thiếu -> fallback đánh thường
+    end
+end
+
+function Hooks.BasicAttack()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then tool:Activate() end
+end
+
+-- ===================== CORE: NHÂN VẬT =====================
+local function GetCharacter()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hum and hrp and hum.Health > 0 then return char, hum, hrp end
+end
+
+local function EquipWeapon(hum)
+    if hum.Parent:FindFirstChildOfClass("Tool") then return end
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if not bp then return end
+    local tool = (Config.WeaponName ~= "" and bp:FindFirstChild(Config.WeaponName)) or bp:FindFirstChildOfClass("Tool")
+    if tool then hum:EquipTool(tool) end
+end
+
+-- ----- Noclip (nhiều "chủ sở hữu": Farm / Tween / Manual) -----
+local NoclipOwners, NoclipConn, NoclipOriginal = {}, nil, {}
+
+local function SetNoclip(owner, state)
+    NoclipOwners[owner] = state or nil
+    local want = next(NoclipOwners) ~= nil
+    if want and not NoclipConn then
+        NoclipConn = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            for _, p in ipairs(char:GetChildren()) do
+                if p:IsA("BasePart") and p.CanCollide then
+                    NoclipOriginal[p] = true -- nhớ để khôi phục chính xác
+                    p.CanCollide = false
+                end
+            end
+        end)
+    elseif not want and NoclipConn then
+        NoclipConn:Disconnect()
+        NoclipConn = nil
+        for p in pairs(NoclipOriginal) do
+            if p.Parent then p.CanCollide = true end
+        end
+        table.clear(NoclipOriginal)
+    end
+end
+
+-- ----- Hover: chống rơi khi đứng/tween giữa không trung -----
+local function EnsureHover(hrp)
+    if hrp:FindFirstChild("HubHover") then return end
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "HubHover"
+    bv.Velocity = Vector3.zero
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Parent = hrp
+end
+
+local function RemoveHover()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local bv = hrp and hrp:FindFirstChild("HubHover")
+    if bv then bv:Destroy() end
+end
+
+-- ----- TweenTo -----
+local CurrentTween
+
+local function CancelTween()
+    if CurrentTween then CurrentTween:Cancel() CurrentTween = nil end
+end
+
+local function StopTween() -- dừng hẳn + dọn trạng thái
+    CancelTween()
+    SetNoclip("Tween", false)
+    if not Config.AutoFarm then RemoveHover() end
+end
+
+-- Trả về true nếu tới đích. abortIf(): hàm tùy chọn, trả true để hủy giữa chừng.
+local function TweenTo(targetCFrame, abortIf)
+    local _, _, hrp = GetCharacter()
+    if not hrp then return false end
+    local dist = (hrp.Position - targetCFrame.Position).Magnitude
+    if dist < 3 then hrp.CFrame = targetCFrame return true end
+
+    CancelTween()
+    SetNoclip("Tween", true)
+    EnsureHover(hrp)
+
+    local duration = dist / math.clamp(Config.TweenSpeed, 50, 500)
+    local tween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+    local finalState
+    tween.Completed:Once(function(state) finalState = state end)
+    CurrentTween = tween
+    tween:Play()
+
+    local deadline = os.clock() + duration + 2 -- chống treo vĩnh viễn
+    while finalState == nil do
+        if Destroyed or (abortIf and abortIf()) or not GetCharacter() or os.clock() > deadline then
+            tween:Cancel()
+            break
+        end
+        task.wait()
+    end
+
+    -- Chỉ dọn nếu tween này vẫn là tween hiện hành (tránh phá tween mới thay thế nó)
+    if CurrentTween == tween then
+        CurrentTween = nil
+        SetNoclip("Tween", false)
+        if not Config.AutoFarm then RemoveHover() end
+    end
+    return finalState == Enum.PlaybackState.Completed
+end
+
+-- ===================== CORE: QUÁI =====================
+-- Trả về danh sách {Model, Root, Humanoid, Dist} còn sống, sắp xếp gần -> xa.
+local function GetMobs(mobName, origin, radius)
+    local result = {}
+    local folder = Hooks.GetEnemiesFolder()
+    if not folder then return result end
+    for _, mob in ipairs(folder:GetChildren()) do
+        if not mobName or mob.Name == mobName then
+            local root = mob:FindFirstChild("HumanoidRootPart")
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                local d = (root.Position - origin).Magnitude
+                if d <= radius then
+                    table.insert(result, {Model = mob, Root = root, Humanoid = hum, Dist = d})
+                end
+            end
+        end
+    end
+    table.sort(result, function(a, b) return a.Dist < b.Dist end)
+    return result
+end
+
+local LastSimBoost = 0
+local function BoostNetworkOwnership() -- cần executor hỗ trợ; lỗi thì bỏ qua
+    if os.clock() - LastSimBoost < 5 then return end
+    LastSimBoost = os.clock()
+    pcall(function()
+        if sethiddenproperty then sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end
+        if setsimulationradius then setsimulationradius(math.huge, math.huge) end
+    end)
+end
+
+-- Gom quái về điểm phía trước nhân vật.
+local MAX_BRING = 25
+local function BringMobs(mobs, point)
+    BoostNetworkOwnership()
+    for i = 1, math.min(#mobs, MAX_BRING) do
+        local m = mobs[i]
+        if (m.Root.Position - point).Magnitude > 4 then -- bỏ qua quái đã ở đúng chỗ
+            m.Root.CFrame = CFrame.new(point)
+            m.Root.AssemblyLinearVelocity = Vector3.zero
+            m.Root.CanCollide = false
+        end
+    end
+end
+
+-- ===================== CORE: QUEST + FARM =====================
+local ZONE_RADIUS = 150
+local State = {Entry = nil, QuestFails = 0, QuestRetryAt = 0, Status = "Idle"}
+
+local function GetQuestEntry()
+    local list = QuestData[Hooks.GetSea()]
+    if not list then return nil end
+    local level, best = Hooks.GetLevel(), nil
+    for _, e in ipairs(list) do
+        if level >= e.MinLevel and (not best or e.MinLevel > best.MinLevel) then best = e end
+    end
+    return best or list[1] -- level thấp hơn mọi mốc -> dùng mốc đầu
+end
+
+local function AbortFarm() return Destroyed or not Config.AutoFarm end
+
+local function FarmStep()
+    local _, hum, hrp = GetCharacter()
+    if not hrp then
+        State.Status = "Đang chờ hồi sinh..."
+        task.wait(1)
+        return
+    end
+    local entry = GetQuestEntry()
+    if not entry then State.Status = "Thiếu QuestData cho Sea này" task.wait(2) return end
+    if State.Entry ~= entry then State.Entry = entry State.QuestFails = 0 end
+
+    SetNoclip("Farm", true)
+    EnsureHover(hrp)
+    EquipWeapon(hum)
+
+    -- 1) Nhận quest (tối đa 3 lần thất bại, nghỉ 30s rồi thử lại - không kẹt vòng lặp)
+    local canTryQuest = State.QuestFails < 3 or os.clock() > State.QuestRetryAt
+    if Config.AutoQuest and canTryQuest and not Hooks.HasActiveQuest(entry) then
+        if State.QuestFails >= 3 then State.QuestFails = 0 end
+        State.Status = "Đi nhận quest: " .. entry.QuestName
+        if TweenTo(entry.NPCPos, AbortFarm) then
+            Hooks.StartQuest(entry)
+            task.wait(0.6)
+            if Hooks.HasActiveQuest(entry) then
+                State.QuestFails = 0
+            else
+                State.QuestFails += 1
+                if State.QuestFails >= 3 then State.QuestRetryAt = os.clock() + 30 end
+            end
+        end
+        return
+    end
+
+    -- 2) Về bãi quái nếu đang ở quá xa
+    local anchor = entry.MobPos + Vector3.new(0, Config.FarmHeight, 0)
+    if (hrp.Position - anchor.Position).Magnitude > ZONE_RADIUS then
+        State.Status = "Di chuyển tới bãi quái"
+        TweenTo(anchor, AbortFarm)
+        return
+    end
+
+    -- 3) Farm
+    local mobs = GetMobs(entry.MobName, hrp.Position, ZONE_RADIUS)
+    local target = mobs[1]
+    if Config.BringMobs then
+        State.Status = ("Farm + gom quái (%d)"):format(#mobs)
+        if (hrp.Position - anchor.Position).Magnitude > 4 then hrp.CFrame = anchor end -- đứng yên tại anchor
+    elseif target then
+        State.Status = "Farm: " .. entry.MobName
+        local pos = CFrame.new(target.Root.Position + Vector3.new(0, Config.FarmHeight, 0))
+        if (hrp.Position - pos.Position).Magnitude > 15 then
+            TweenTo(pos, AbortFarm)
+        else
+            hrp.CFrame = pos
+        end
+    else
+        State.Status = "Chờ quái hồi sinh"
+        if (hrp.Position - anchor.Position).Magnitude > 4 then TweenTo(anchor, AbortFarm) end
+    end
+
+    if not Config.FastAttack then Hooks.BasicAttack() end
+end
+
+local function FarmCleanup()
+    State.Entry = nil
+    State.Status = "Idle"
+    StopTween()
+    SetNoclip("Farm", false)
+    RemoveHover()
+end
+
+local function BringStep()
+    local _, _, hrp = GetCharacter()
+    if not hrp then return end
+    local name = (Config.AutoFarm and State.Entry) and State.Entry.MobName or nil
+    local yOff = Config.AutoFarm and -Config.FarmHeight or 0
+    local point = hrp.Position + hrp.CFrame.LookVector * Config.BringForward + Vector3.new(0, yOff, 0)
+    BringMobs(GetMobs(name, hrp.Position, Config.BringRadius), point)
+end
+
+local function AttackStep()
+    local _, hum, hrp = GetCharacter()
+    if not hrp then return end
+    EquipWeapon(hum)
+    local name = (Config.AutoFarm and State.Entry) and State.Entry.MobName or nil
+    local mobs = GetMobs(name, hrp.Position, Config.AttackRange)
+    if #mobs > 0 then Hooks.FastAttack(mobs) end
+end
+
+-- ===================== LOOP MANAGER (task.spawn) =====================
+-- Mỗi loop chỉ chạy 1 bản duy nhất; tự thoát khi tắt Config hoặc Destroyed.
+local Running = {}
+local function StartLoop(name, flagKey, interval, step, onStop)
+    if Running[name] then return end
+    Running[name] = true
+    task.spawn(function()
+        while Config[flagKey] and not Destroyed do
+            local ok, err = pcall(step)
+            if not ok then
+                warn(("[Hub] Lỗi loop %s: %s"):format(name, tostring(err)))
+                task.wait(1)
+            end
+            task.wait(type(interval) == "function" and interval() or interval)
+        end
+        Running[name] = nil
+        if onStop and not Destroyed then pcall(onStop) end
+    end)
+end
+
+local Renderers, Handlers = {}, {}
+
+Handlers.AutoFarm   = function(on) if on then StartLoop("Farm", "AutoFarm", 0.1, FarmStep, FarmCleanup) else StopTween() end end
+Handlers.BringMobs  = function(on) if on then StartLoop("Bring", "BringMobs", 0.25, BringStep) end end
+Handlers.FastAttack = function(on) if on then StartLoop("Attack", "FastAttack", function() return math.max(Config.AttackDelay, 0.05) end, AttackStep) end end
+Handlers.Noclip     = function(on) SetNoclip("Manual", on) end
+
+local function SetFeature(key, value)
+    Config[key] = value
+    if Renderers[key] then Renderers[key]() end
+    if Handlers[key] then Handlers[key](value) end
+end
+
+Track(LocalPlayer.Idled:Connect(function()
+    if Config.AntiAFK then
+        pcall(function() VirtualUser:CaptureController() VirtualUser:ClickButton2(Vector2.new()) end)
+    end
+end))
+
+-- ===================== UI =====================
+local Theme = {
+    Bg = Color3.fromRGB(24, 24, 30), Panel = Color3.fromRGB(38, 38, 48), Accent = Color3.fromRGB(88, 101, 242),
+    Text = Color3.fromRGB(235, 235, 240), Sub = Color3.fromRGB(150, 150, 165),
+    On = Color3.fromRGB(67, 181, 129), Off = Color3.fromRGB(90, 90, 105), Danger = Color3.fromRGB(220, 70, 70),
+}
+
+local function New(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    inst.Parent = parent
+    return inst
+end
+local function Round(inst, r)
+    New("UICorner", {CornerRadius = typeof(r) == "UDim" and r or UDim.new(0, r)}, inst)
+end
+local CIRCLE = UDim.new(1, 0)
+
+local ScreenGui = New("ScreenGui", {
+    Name = "Hub_" .. math.random(1e5, 9e5), ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(ScreenGui) end end)
+local okParent = pcall(function() ScreenGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not okParent or not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local function ScreenSize()
+    local cam = Workspace.CurrentCamera
+    return cam and cam.ViewportSize or Vector2.new(800, 400)
+end
+
+-- Kéo thả (cảm ứng/chuột) + phân biệt "chạm" và "kéo"; luôn giữ trong màn hình.
+local function MakeDraggable(handle, target, onTap)
+    local dragging, moved, dragInput, dragStart, startPos = false, false, nil, nil, nil
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, moved = true, false
+            dragStart, startPos = input.Position, target.AbsolutePosition
+            local c
+            c = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    c:Disconnect()
+                    if not moved and onTap then onTap() end
+                end
+            end)
+        end
+    end)
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.T
