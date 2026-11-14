@@ -1,0 +1,501 @@
+--[[
+    SCRIPT HUB AUTO FARM (Research Template) - Luau
+    Cấu trúc: Config > Utils > Movement > Mobs > Combat > Quest > AutoFarm > UI > Cleanup
+]]
+
+-- Chống chạy trùng: dọn bản cũ trước khi chạy bản mới
+if getgenv().__HubCleanup then pcall(getgenv().__HubCleanup) end
+
+--// SERVICES
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser       = game:GetService("VirtualUser")
+local CoreGui           = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// CONFIG (trạng thái bật/tắt)
+getgenv().Config = getgenv().Config or {}
+local Config = getgenv().Config
+local Defaults = {
+    AutoFarm   = false,
+    BringMobs  = false,
+    AutoQuest  = false,
+    FastAttack = false,
+    AntiAFK    = true,
+    TweenSpeed = 250,   -- studs/giây
+    FarmHeight = 8,     -- độ cao đứng trên quái
+    BringRange = 250,   -- bán kính gom quái
+    BringLimit = 12,    -- số quái tối đa mỗi lần gom (giảm lag)
+}
+for k, v in pairs(Defaults) do
+    if Config[k] == nil then Config[k] = v end
+end
+
+--// PLACEHOLDERS - SỬA CHO KHỚP GAME CỦA BẠN
+local PH = {
+    EnemiesFolder = function() return workspace:FindFirstChild("Enemies") end, -- [PLACEHOLDER] folder chứa quái
+    CommRemote    = function()                                                  -- [PLACEHOLDER] RemoteFunction/Event nhận quest
+        local r = ReplicatedStorage:FindFirstChild("Remotes")
+        return r and r:FindFirstChild("CommF_")
+    end,
+    AttackRemote  = function()                                                  -- [PLACEHOLDER] RemoteEvent đánh
+        local r = ReplicatedStorage:FindFirstChild("Remotes")
+        return r and r:FindFirstChild("RegisterAttack")
+    end,
+    GetLevel = function()                                                       -- [PLACEHOLDER] cách đọc level
+        local d = LocalPlayer:FindFirstChild("Data")
+        local l = d and d:FindFirstChild("Level")
+        return l and l.Value or 1
+    end,
+    IsQuestActive = function()                                                  -- [PLACEHOLDER] kiểm tra đang có quest
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local q = gui and gui:FindFirstChild("Main") and gui.Main:FindFirstChild("Quest")
+        return q ~= nil and q.Visible
+    end,
+    StartQuest = function(remote, quest)                                        -- [PLACEHOLDER] cú pháp gọi quest
+        if remote:IsA("RemoteFunction") then
+            remote:InvokeServer("StartQuest", quest.QuestName, quest.QuestIndex)
+        else
+            remote:FireServer("StartQuest", quest.QuestName, quest.QuestIndex)
+        end
+    end,
+    SeaByPlaceId = { -- [PLACEHOLDER] PlaceId từng Sea
+        [0] = 1, [1] = 2, [2] = 3,
+    },
+}
+
+--// QUEST DATA MẪU (tọa độ giả lập)
+local QuestData = {
+    [1] = {
+        { MinLevel = 1,  MaxLevel = 14, QuestName = "BanditQuest1", QuestIndex = 1, MobName = "Bandit",
+          NPC = CFrame.new(1060, 16, 1547),  MobArea = CFrame.new(1200, 16, 1600) },
+        { MinLevel = 15, MaxLevel = 29, QuestName = "MonkeyQuest",  QuestIndex = 1, MobName = "Monkey",
+          NPC = CFrame.new(-1600, 36, 150),  MobArea = CFrame.new(-1500, 36, 100) },
+    },
+    [2] = {
+        { MinLevel = 700, MaxLevel = 724, QuestName = "Area1Quest", QuestIndex = 1, MobName = "Raider",
+          NPC = CFrame.new(-420, 73, 1836),  MobArea = CFrame.new(-500, 73, 1900) },
+    },
+    [3] = {
+        { MinLevel = 1500, MaxLevel = 1524, QuestName = "PortQuest", QuestIndex = 1, MobName = "Pirate Millionaire",
+          NPC = CFrame.new(-290, 43, 5580),  MobArea = CFrame.new(-350, 43, 5600) },
+    },
+}
+
+local TeleportPoints = {
+    [1] = { ["Starter Island"] = CFrame.new(1060, 16, 1547), ["Jungle"] = CFrame.new(-1600, 36, 150) },
+    [2] = { ["Dock"] = CFrame.new(-420, 73, 1836) },
+    [3] = { ["Port Town"] = CFrame.new(-290, 43, 5580) },
+}
+
+--// STATE
+local Connections, CurrentTween = {}, nil
+local State = { Target = nil, Alive = true, Sea = PH.SeaByPlaceId[game.PlaceId] or 1 }
+
+local function track(conn) table.insert(Connections, conn); return conn end
+
+--// UTILS
+local function getChar()  return LocalPlayer.Character end
+local function getRoot()
+    local c = getChar()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function getHum()
+    local c = getChar()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function isAlive(model)
+    local h = model and model:FindFirstChildOfClass("Humanoid")
+    return h ~= nil and h.Health > 0 and model:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+--// NOCLIP + HOVER (chỉ chạy khi cần, tránh tốn tài nguyên)
+local NoclipOn = false
+track(RunService.Stepped:Connect(function()
+    if not NoclipOn then return end
+    local c = getChar()
+    if not c then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+    end
+end))
+
+local function setHover(on)
+    local root = getRoot()
+    if not root then return end
+    local bv = root:FindFirstChild("HubHover")
+    if on and not bv then
+        bv = Instance.new("BodyVelocity")
+        bv.Name, bv.MaxForce, bv.Velocity = "HubHover", Vector3.new(1e5, 1e5, 1e5), Vector3.zero
+        bv.Parent = root
+    elseif not on and bv then
+        bv:Destroy()
+    end
+end
+
+local function setFarmingMode(on)
+    NoclipOn = on
+    setHover(on)
+end
+
+--// TWEEN
+local function CancelTween()
+    if CurrentTween then CurrentTween:Cancel(); CurrentTween = nil end
+end
+
+local function TweenTo(targetCF, speed)
+    local root = getRoot()
+    if not root then return false end
+    speed = speed or Config.TweenSpeed
+    local dist = (root.Position - targetCF.Position).Magnitude
+    if dist < 4 then root.CFrame = targetCF return true end
+
+    CancelTween()
+    NoclipOn = true
+    setHover(true)
+    local tween = TweenService:Create(root, TweenInfo.new(dist / speed, Enum.EasingStyle.Linear), { CFrame = targetCF })
+    CurrentTween = tween
+    tween:Play()
+    local state = tween.Completed:Wait() -- trả về cả khi bị Cancel
+    if CurrentTween == tween then CurrentTween = nil end
+    return state == Enum.PlaybackState.Completed
+end
+
+--// QUEST LOOKUP
+local function getQuestForLevel()
+    local lvl, list = PH.GetLevel(), QuestData[State.Sea]
+    if not list then return nil end
+    local best
+    for _, q in ipairs(list) do
+        if lvl >= q.MinLevel and lvl <= q.MaxLevel then return q end
+        if lvl >= q.MinLevel then best = q end -- fallback: quest gần nhất dưới level
+    end
+    return best
+end
+
+--// MOBS
+local function getMobs(name, range, origin)
+    local folder, result = PH.EnemiesFolder(), {}
+    if not folder then return result end
+    for _, m in ipairs(folder:GetChildren()) do
+        if m.Name == name and isAlive(m) then
+            local d = (m.HumanoidRootPart.Position - origin).Magnitude
+            if d <= range then table.insert(result, { mob = m, dist = d }) end
+        end
+    end
+    table.sort(result, function(a, b) return a.dist < b.dist end)
+    return result
+end
+
+local function BringMobs(mobName)
+    local root = getRoot()
+    if not root or not State.Target then return end
+    -- điểm gom: ngay dưới chân nhân vật để quái nằm trong tầm đánh
+    local point = root.CFrame * CFrame.new(0, -Config.FarmHeight + 2, -4)
+    pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
+
+    local list = getMobs(mobName, Config.BringRange, root.Position)
+    for i = 1, math.min(#list, Config.BringLimit) do
+        local m = list[i].mob
+        local hrp = m.HumanoidRootPart
+        hrp.CanCollide = false
+        hrp.Velocity = Vector3.zero
+        hrp.CFrame = point
+    end
+end
+
+--// COMBAT
+local function equipTool()
+    local char, hum = getChar(), getHum()
+    if not (char and hum) then return nil end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then return tool end
+    local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+    tool = bp and bp:FindFirstChildOfClass("Tool")
+    if tool then hum:EquipTool(tool) end
+    return tool
+end
+
+local function Attack()
+    local tool = equipTool()
+    if not tool then return end
+    local remote = PH.AttackRemote()
+    if remote then
+        pcall(function() remote:FireServer(0.4) end) -- [PLACEHOLDER] tham số tấn công
+    end
+    pcall(function() tool:Activate() end)
+end
+
+--// AUTO FARM STEP
+local function farmStep()
+    local quest = getQuestForLevel()
+    if not quest then State.Target = nil return end
+
+    -- 1. Nhận quest
+    if Config.AutoQuest and not PH.IsQuestActive() then
+        State.Target = nil
+        if TweenTo(quest.NPC) and Config.AutoFarm then
+            local remote = PH.CommRemote()
+            if remote then pcall(PH.StartQuest, remote, quest) end
+            task.wait(0.5)
+        end
+        return
+    end
+
+    -- 2. Tìm quái (ưu tiên gần nhất; nếu chưa có thì bay tới bãi quái)
+    local root = getRoot()
+    if not root then return end
+    local mobs = getMobs(quest.MobName, 2000, root.Position)
+    if #mobs == 0 then
+        State.Target = nil
+        TweenTo(quest.MobArea * CFrame.new(0, Config.FarmHeight, 0))
+        task.wait(0.5) -- chờ respawn quái
+        return
+    end
+
+    -- 3. Bay lên đầu quái, nhìn xuống, giữ vị trí tới khi quái chết
+    local mob = mobs[1].mob
+    State.Target = mob
+    while Config.AutoFarm and isAlive(mob) and State.Alive do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        local r = getRoot()
+        if not (hrp and r) then break end
+        if (r.Position - hrp.Position).Magnitude > 60 then
+            TweenTo(hrp.CFrame * CFrame.new(0, Config.FarmHeight, 0))
+        else
+            r.CFrame = CFrame.new(hrp.Position + Vector3.new(0, Config.FarmHeight, 0), hrp.Position)
+        end
+        if Config.AutoQuest and not PH.IsQuestActive() then break end -- quest xong → nhận lại
+        task.wait()
+    end
+    State.Target = nil
+end
+
+--// BACKGROUND LOOPS (task.spawn, mỗi vòng tự ngủ khi tắt)
+local Running = true
+
+task.spawn(function() -- AutoFarm
+    while Running do
+        if Config.AutoFarm and State.Alive and getRoot() then
+            local ok, err = pcall(farmStep)
+            if not ok then warn("[Hub] AutoFarm:", err); task.wait(1) end
+        else
+            if NoclipOn or CurrentTween then
+                CancelTween(); setFarmingMode(false); State.Target = nil
+            end
+            task.wait(0.3)
+        end
+        task.wait()
+    end
+end)
+
+task.spawn(function() -- BringMobs
+    while Running do
+        if Config.BringMobs and Config.AutoFarm and State.Target then
+            local q = getQuestForLevel()
+            if q then pcall(BringMobs, q.MobName) end
+            task.wait(0.15)
+        else
+            task.wait(0.4)
+        end
+    end
+end)
+
+task.spawn(function() -- FastAttack
+    while Running do
+        local t = State.Target
+        local root = getRoot()
+        if Config.AutoFarm and t and isAlive(t) and root
+            and (root.Position - t.HumanoidRootPart.Position).Magnitude <= 70 then
+            pcall(Attack)
+            task.wait(Config.FastAttack and 0.05 or 0.35)
+        else
+            task.wait(0.2)
+        end
+    end
+end)
+
+--// CHARACTER EVENTS
+local function onCharacter(char)
+    State.Alive = true
+    local hum = char:WaitForChild("Humanoid", 10)
+    if hum then
+        track(hum.Died:Connect(function()
+            State.Alive = false; State.Target = nil
+            CancelTween(); NoclipOn = false
+        end))
+    end
+    char:WaitForChild("HumanoidRootPart", 10)
+    State.Alive = true
+end
+track(LocalPlayer.CharacterAdded:Connect(onCharacter))
+if LocalPlayer.Character then task.spawn(onCharacter, LocalPlayer.Character) end
+
+track(LocalPlayer.Idled:Connect(function()
+    if Config.AntiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end))
+
+--// UI
+local THEME = {
+    Bg = Color3.fromRGB(24, 24, 30), Panel = Color3.fromRGB(34, 34, 44),
+    Accent = Color3.fromRGB(88, 130, 255), Off = Color3.fromRGB(60, 60, 74),
+    Text = Color3.fromRGB(235, 235, 245),
+}
+
+local function new(class, props, children)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    for _, c in ipairs(children or {}) do c.Parent = o end
+    return o
+end
+local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
+
+local guiParent = (gethui and gethui()) or pcall(function() return CoreGui.Name end) and CoreGui or LocalPlayer:WaitForChild("PlayerGui")
+local Gui = new("ScreenGui", { Name = "ScriptHubUI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(Gui) end end)
+Gui.Parent = guiParent
+
+local Main = new("Frame", {
+    Size = UDim2.fromOffset(300, 240), Position = UDim2.new(0.5, -150, 0.5, -120),
+    BackgroundColor3 = THEME.Bg, Visible = false, Parent = Gui,
+}, { corner(14) })
+
+local TitleBar = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, Text = "  Script Hub (Drag)",
+    TextColor3 = THEME.Text, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = Main,
+})
+local TabBar = new("Frame", {
+    Size = UDim2.new(1, -16, 0, 34), Position = UDim2.fromOffset(8, 36), BackgroundTransparency = 1, Parent = Main,
+}, { new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }) })
+
+local Pages, TabButtons = {}, {}
+local function createPage(name)
+    local page = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -84), Position = UDim2.fromOffset(8, 76), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(), Visible = false, Parent = Main,
+    }, { new("UIListLayout", { Padding = UDim.new(0, 6) }) })
+    Pages[name] = page
+
+    local btn = new("TextButton", {
+        Size = UDim2.new(0, 88, 1, 0), BackgroundColor3 = THEME.Off, Text = name,
+        TextColor3 = THEME.Text, Font = Enum.Font.GothamMedium, TextSize = 13, Parent = TabBar,
+    }, { corner(8) })
+    TabButtons[name] = btn
+    btn.Activated:Connect(function()
+        for n, p in pairs(Pages) do
+            p.Visible = (n == name)
+            TabButtons[n].BackgroundColor3 = (n == name) and THEME.Accent or THEME.Off
+        end
+    end)
+    return page
+end
+
+local function createToggle(page, text, key)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = THEME.Panel, AutoButtonColor = false,
+        Text = "", Parent = page,
+    }, { corner(10) })
+    new("TextLabel", {
+        Size = UDim2.new(1, -70, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
+        Text = text, TextColor3 = THEME.Text, Font = Enum.Font.Gotham, TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left, Parent = btn,
+    })
+    local pill = new("Frame", { Size = UDim2.fromOffset(40, 22), Position = UDim2.new(1, -52, 0.5, -11),
+        BackgroundColor3 = THEME.Off, Parent = btn }, { corner(11) })
+    local knob = new("Frame", { Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(2, 2),
+        BackgroundColor3 = THEME.Text, Parent = pill }, { corner(9) })
+    local function render()
+        local on = Config[key]
+        pill.BackgroundColor3 = on and THEME.Accent or THEME.Off
+        knob.Position = on and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2)
+    end
+    btn.Activated:Connect(function() Config[key] = not Config[key]; render() end)
+    render()
+end
+
+local function createButton(page, text, callback)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = THEME.Panel, Text = text,
+        TextColor3 = THEME.Text, Font = Enum.Font.Gotham, TextSize = 14, Parent = page,
+    }, { corner(10) })
+    b.Activated:Connect(callback)
+end
+
+-- Tabs
+local MainPage, TpPage, MiscPage = createPage("Main"), createPage("Teleport"), createPage("Misc")
+createToggle(MainPage, "Auto Farm",   "AutoFarm")
+createToggle(MainPage, "Auto Quest",  "AutoQuest")
+createToggle(MainPage, "Bring Mobs",  "BringMobs")
+createToggle(MainPage, "Fast Attack", "FastAttack")
+
+for name, cf in pairs(TeleportPoints[State.Sea] or {}) do
+    createButton(TpPage, "Teleport: " .. name, function()
+        task.spawn(function()
+            local was = Config.AutoFarm
+            Config.AutoFarm = false -- tránh tranh chấp tween với AutoFarm
+            task.wait(0.2)
+            TweenTo(cf)
+            if not Config.AutoFarm then setFarmingMode(false) end
+            Config.AutoFarm = was
+        end)
+    end)
+end
+createToggle(MiscPage, "Anti AFK", "AntiAFK")
+createButton(MiscPage, "Destroy Hub", function() if getgenv().__HubCleanup then getgenv().__HubCleanup() end end)
+
+TabButtons.Main:Activate()
+-- kích hoạt tab đầu thủ công (Activate trên Instance không fire event):
+Pages.Main.Visible = true; TabButtons.Main.BackgroundColor3 = THEME.Accent
+
+-- Nút tròn nổi + kéo thả (phân biệt chạm và kéo)
+local Toggle = new("TextButton", {
+    Size = UDim2.fromOffset(52, 52), Position = UDim2.new(0, 16, 0.4, 0), BackgroundColor3 = THEME.Accent,
+    Text = "≡", TextColor3 = THEME.Text, Font = Enum.Font.GothamBold, TextSize = 24,
+    AutoButtonColor = false, Parent = Gui,
+}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+
+local function makeDraggable(handle, target, onTap)
+    local dragging, moved, startPos, startInput
+    track(handle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, moved, startInput, startPos = true, false, i.Position, target.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = i.Position - startInput
+            if d.Magnitude > 8 then moved = true end
+            if moved then
+                target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                            startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1) then
+            dragging = false
+            if not moved and onTap then onTap() end
+        end
+    end))
+end
+makeDraggable(Toggle, Toggle, function() Main.Visible = not Main.Visible end)
+makeDraggable(TitleBar, Main)
+
+--// CLEANUP
+getgenv().__HubCleanup = function()
+    Running = false
+    Config.AutoFarm, Config.BringMobs, Config.AutoQuest, Config.FastAttack = false, false, false, false
+    CancelTween(); NoclipOn = false; setHover(false)
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+    if Gui then Gui:Destroy() end
+    getgenv().__HubCleanup = nil
+end
