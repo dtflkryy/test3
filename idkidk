@@ -1,0 +1,587 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local LP = Players.LocalPlayer
+
+local env = (getgenv and getgenv()) or _G
+if env.__MobHubCleanup then pcall(env.__MobHubCleanup) end
+
+local PARENT do
+    local ok, p = pcall(function()
+        return (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    PARENT = (ok and p) or LP:WaitForChild("PlayerGui")
+end
+
+local WHITE = Color3.new(1, 1, 1)
+local C_ON = Color3.fromRGB(0, 140, 60)
+local C_OFF = Color3.fromRGB(45, 45, 52)
+local BOLD = Enum.Font.GothamBold
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local function round(o, r)
+    new("UICorner", { CornerRadius = UDim.new(0, r) }, o)
+end
+
+local S = {
+    NV = false,
+    ESP = false,
+    Tracer = true,
+    Text = true,
+    Chams = true,
+    Bar = true,
+    AutoColor = true,
+    Color = Color3.fromRGB(255, 60, 60),
+    Origin = "Bottom",
+    Range = 300,
+    Locked = false,
+}
+local conns = {}
+
+local NVSet = {
+    Brightness = 2,
+    Ambient = Color3.fromRGB(200, 255, 200),
+    OutdoorAmbient = Color3.fromRGB(200, 255, 200),
+    ClockTime = 14,
+    FogEnd = 1e6,
+    GlobalShadows = false,
+}
+local nvSaved, nvConns = {}, {}
+
+local function nvApply(p, v)
+    if Lighting[p] ~= v then Lighting[p] = v end
+end
+
+local function setNV(on)
+    if on and next(nvConns) then return end
+    S.NV = on
+    local atm = Lighting:FindFirstChildOfClass("Atmosphere")
+    if on then
+        for p, v in pairs(NVSet) do
+            nvSaved[p] = Lighting[p]
+            nvApply(p, v)
+            nvConns[p] = Lighting:GetPropertyChangedSignal(p):Connect(function()
+                if S.NV then nvApply(p, v) end
+            end)
+        end
+        if atm then
+            nvSaved.Density = atm.Density
+            atm.Density = 0
+        end
+    else
+        for p, c in pairs(nvConns) do
+            c:Disconnect()
+            nvConns[p] = nil
+        end
+        for p in pairs(NVSet) do
+            if nvSaved[p] ~= nil then Lighting[p] = nvSaved[p] end
+        end
+        if atm and nvSaved.Density then atm.Density = nvSaved.Density end
+    end
+end
+
+local layer = new("ScreenGui", {
+    Name = "MobESPLayer",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 5,
+}, PARENT)
+
+local barC = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 6),
+    Size = UDim2.fromOffset(170, 30),
+    BackgroundTransparency = 1,
+    Visible = false,
+}, layer)
+
+local barText = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 16),
+    BackgroundTransparency = 1,
+    Font = BOLD,
+    TextSize = 14,
+    TextStrokeTransparency = 0.4,
+    Text = "",
+}, barC)
+
+local barBg = new("Frame", {
+    Position = UDim2.new(0, 0, 0, 18),
+    Size = UDim2.new(1, 0, 0, 10),
+    BackgroundColor3 = Color3.fromRGB(15, 15, 15),
+    BackgroundTransparency = 0.3,
+    BorderSizePixel = 0,
+}, barC)
+round(barBg, 5)
+
+local barFill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BorderSizePixel = 0,
+}, barBg)
+round(barFill, 5)
+
+local mobs = {}
+local scanId = 0
+local addConn, renderConn
+
+local function getRoot(model)
+    return model.PrimaryPart
+        or model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function removeMob(model)
+    local m = mobs[model]
+    if not m then return end
+    if m.conn then m.conn:Disconnect() end
+    if m.line then m.line:Destroy() end
+    if m.lbl then m.lbl:Destroy() end
+    if m.hl then m.hl:Destroy() end
+    mobs[model] = nil
+end
+
+local function register(hum)
+    local model = hum.Parent
+    if not model or mobs[model] or not model:IsA("Model") then return end
+    if model == LP.Character or Players:GetPlayerFromCharacter(model) then return end
+    local m = { hum = hum, model = model }
+    m.conn = model.AncestryChanged:Connect(function(_, parent)
+        if not parent then removeMob(model) end
+    end)
+    mobs[model] = m
+end
+
+local function ensure(m)
+    if m.line then return end
+    m.line = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BorderSizePixel = 0,
+        BackgroundTransparency = 0.15,
+        Visible = false,
+    }, layer)
+    m.lbl = new("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(160, 16),
+        BackgroundTransparency = 1,
+        Font = BOLD,
+        TextSize = 13,
+        TextStrokeTransparency = 0.4,
+        Visible = false,
+    }, layer)
+    m.hl = new("Highlight", {
+        Adornee = m.model,
+        FillTransparency = 0.65,
+        OutlineTransparency = 0,
+        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        Enabled = false,
+    }, layer)
+end
+
+local function hide(m)
+    if m.line then
+        m.line.Visible = false
+        m.lbl.Visible = false
+        m.hl.Enabled = false
+    end
+end
+
+local function gradColor(d)
+    return Color3.fromHSV(math.clamp(d / 120, 0, 1) * 0.33, 1, 1)
+end
+
+local function update()
+    local cam = Workspace.CurrentCamera
+    local char = LP.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+    if not cam or not myRoot then
+        for _, m in pairs(mobs) do hide(m) end
+        barC.Visible = false
+        return
+    end
+
+    local vp = cam.ViewportSize
+    local center = vp / 2
+    local bottom = Vector2.new(center.X, vp.Y - 12)
+    local half = center - Vector2.new(36, 40)
+    local camCF = cam.CFrame
+    local myPos = myRoot.Position
+    local nearest = math.huge
+
+    for model, m in pairs(mobs) do
+        local root = m.root
+        if not root or not root.Parent then
+            root = getRoot(model)
+            m.root = root
+        end
+
+        if not root or m.hum.Health <= 0 then
+            hide(m)
+        else
+            local pos3 = root.Position
+            local dist = (pos3 - myPos).Magnitude
+            if dist > S.Range then
+                hide(m)
+            else
+                ensure(m)
+                if dist < nearest then nearest = dist end
+                local col = S.AutoColor and gradColor(dist) or S.Color
+
+                local p, vis = cam:WorldToViewportPoint(pos3)
+                local target, from
+                local behind = false
+                if vis then
+                    target = Vector2.new(p.X, p.Y)
+                    from = (S.Origin == "Bottom") and bottom or center
+                else
+                    local rel = camCF:PointToObjectSpace(pos3)
+                    behind = rel.Z > 0
+                    local d = Vector2.new(rel.X, -rel.Y)
+                    if d.Magnitude < 1e-3 then d = Vector2.new(0, 1) end
+                    d = d.Unit
+                    local kx = d.X ~= 0 and half.X / math.abs(d.X) or math.huge
+                    local ky = d.Y ~= 0 and half.Y / math.abs(d.Y) or math.huge
+                    target = center + d * math.min(kx, ky)
+                    from = center
+                end
+
+                local line = m.line
+                local delta = target - from
+                local len = delta.Magnitude
+                if S.Tracer and len > 4 then
+                    line.Visible = true
+                    line.BackgroundColor3 = col
+                    line.Size = UDim2.fromOffset(len, 2)
+                    line.Position = UDim2.fromOffset((from.X + target.X) / 2, (from.Y + target.Y) / 2)
+                    line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                else
+                    line.Visible = false
+                end
+
+                local lbl = m.lbl
+                if S.Text then
+                    lbl.Visible = true
+                    lbl.TextColor3 = col
+                    lbl.Text = string.format("%s | %dm%s", model.Name, math.floor(dist + 0.5), behind and " | BEHIND" or "")
+                    lbl.Position = UDim2.fromOffset(target.X, target.Y - (vis and 20 or 0))
+                else
+                    lbl.Visible = false
+                end
+
+                m.hl.Enabled = S.Chams
+                m.hl.FillColor = col
+                m.hl.OutlineColor = col
+            end
+        end
+    end
+
+    if S.Bar and nearest < math.huge then
+        local col = gradColor(nearest)
+        barC.Visible = true
+        barFill.Size = UDim2.new(math.clamp(1 - nearest / 100, 0, 1), 0, 1, 0)
+        barFill.BackgroundColor3 = col
+        barText.TextColor3 = col
+        barText.Text = "MOB: " .. math.floor(nearest + 0.5) .. "m"
+    else
+        barC.Visible = false
+    end
+end
+
+local function startESP()
+    if renderConn then return end
+    scanId += 1
+    local id = scanId
+    addConn = Workspace.DescendantAdded:Connect(function(d)
+        if d:IsA("Humanoid") then task.defer(register, d) end
+    end)
+    renderConn = RunService.RenderStepped:Connect(update)
+    task.spawn(function()
+        local n = 0
+        for _, d in ipairs(Workspace:GetDescendants()) do
+            if id ~= scanId then return end
+            if d:IsA("Humanoid") then register(d) end
+            n += 1
+            if n % 800 == 0 then task.wait() end
+        end
+    end)
+end
+
+local function stopESP()
+    scanId += 1
+    if addConn then addConn:Disconnect(); addConn = nil end
+    if renderConn then renderConn:Disconnect(); renderConn = nil end
+    for model in pairs(mobs) do removeMob(model) end
+    barC.Visible = false
+end
+
+local function setESP(on)
+    S.ESP = on
+    if on then startESP() else stopESP() end
+end
+
+local hub = new("ScreenGui", {
+    Name = "MobHub",
+    ResetOnSpawn = false,
+    DisplayOrder = 10,
+}, PARENT)
+
+local panel = new("Frame", {
+    Size = UDim2.fromOffset(190, 260),
+    Position = UDim2.new(0, 12, 0.18, 0),
+    BackgroundColor3 = Color3.fromRGB(20, 20, 24),
+    BackgroundTransparency = 0.08,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, hub)
+round(panel, 8)
+
+local title = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = Color3.fromRGB(35, 35, 42),
+    BorderSizePixel = 0,
+}, panel)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -64, 1, 0),
+    Position = UDim2.fromOffset(8, 0),
+    BackgroundTransparency = 1,
+    Font = BOLD,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = WHITE,
+    Text = "Horror Hub",
+}, title)
+
+local function smallBtn(text, xOff)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(22, 22),
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, xOff, 0.5, 0),
+        BackgroundColor3 = C_OFF,
+        TextColor3 = WHITE,
+        Font = BOLD,
+        TextSize = 12,
+        Text = text,
+        BorderSizePixel = 0,
+    }, title)
+    round(b, 5)
+    return b
+end
+
+local lockBtn = smallBtn("🔓", -4)
+local minBtn = smallBtn("-", -30)
+
+local body = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(0, 30),
+    Size = UDim2.new(1, 0, 1, -30),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, panel)
+
+new("UIListLayout", { Padding = UDim.new(0, 4) }, body)
+new("UIPadding", {
+    PaddingLeft = UDim.new(0, 8),
+    PaddingRight = UDim.new(0, 8),
+    PaddingTop = UDim.new(0, 4),
+    PaddingBottom = UDim.new(0, 6),
+}, body)
+
+local refreshers = {}
+local function refreshAll()
+    for _, r in ipairs(refreshers) do r() end
+end
+
+local function mkBtn(h)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, h or 28),
+        BackgroundColor3 = C_OFF,
+        TextColor3 = WHITE,
+        Font = BOLD,
+        TextSize = 12,
+        BorderSizePixel = 0,
+    }, body)
+    round(b, 6)
+    return b
+end
+
+local function toggleRow(label, key, onChange)
+    local b = mkBtn()
+    local function r()
+        local on = S[key]
+        b.Text = label .. ": " .. (on and "ON" or "OFF")
+        b.BackgroundColor3 = on and C_ON or C_OFF
+    end
+    r()
+    table.insert(refreshers, r)
+    b.Activated:Connect(function()
+        local v = not S[key]
+        if onChange then onChange(v) else S[key] = v end
+        r()
+    end)
+end
+
+toggleRow("Night Vision", "NV", setNV)
+toggleRow("Mob ESP", "ESP", setESP)
+toggleRow("Tracer", "Tracer")
+toggleRow("Distance", "Text")
+toggleRow("Chams", "Chams")
+toggleRow("Warning bar", "Bar")
+
+do
+    local b = mkBtn()
+    local function r()
+        b.Text = "Color: " .. (S.AutoColor and "AUTO (distance)" or "FIXED")
+        b.BackgroundColor3 = S.AutoColor and C_ON or C_OFF
+    end
+    r()
+    table.insert(refreshers, r)
+    b.Activated:Connect(function()
+        S.AutoColor = not S.AutoColor
+        refreshAll()
+    end)
+end
+
+do
+    local f = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 26),
+        BackgroundTransparency = 1,
+    }, body)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+    }, f)
+    local cols = {
+        Color3.fromRGB(255, 60, 60), Color3.fromRGB(60, 255, 90),
+        Color3.fromRGB(60, 200, 255), Color3.fromRGB(255, 255, 255),
+        Color3.fromRGB(200, 80, 255),
+    }
+    for _, c in ipairs(cols) do
+        local s = new("TextButton", {
+            Size = UDim2.fromOffset(30, 26),
+            BackgroundColor3 = c,
+            Text = "",
+            BorderSizePixel = 0,
+        }, f)
+        round(s, 6)
+        s.Activated:Connect(function()
+            S.Color = c
+            S.AutoColor = false
+            refreshAll()
+        end)
+    end
+end
+
+do
+    local b = mkBtn()
+    local function r() b.Text = "Tracer from: " .. S.Origin end
+    r()
+    table.insert(refreshers, r)
+    b.Activated:Connect(function()
+        S.Origin = (S.Origin == "Bottom") and "Center" or "Bottom"
+        r()
+    end)
+end
+
+do
+    local f = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundTransparency = 1,
+    }, body)
+
+    local function stepBtn(text, anchorX)
+        local b = new("TextButton", {
+            Size = UDim2.fromOffset(34, 28),
+            AnchorPoint = Vector2.new(anchorX, 0),
+            Position = UDim2.new(anchorX, 0, 0, 0),
+            BackgroundColor3 = C_OFF,
+            TextColor3 = WHITE,
+            Font = BOLD,
+            TextSize = 14,
+            Text = text,
+            BorderSizePixel = 0,
+        }, f)
+        round(b, 6)
+        return b
+    end
+    local minus = stepBtn("-", 0)
+    local plus = stepBtn("+", 1)
+
+    local lb = new("TextLabel", {
+        Size = UDim2.new(1, -76, 1, 0),
+        Position = UDim2.fromOffset(38, 0),
+        BackgroundTransparency = 1,
+        Font = BOLD,
+        TextSize = 12,
+        TextColor3 = WHITE,
+    }, f)
+    local function r() lb.Text = "Range: " .. S.Range end
+    r()
+    table.insert(refreshers, r)
+    minus.Activated:Connect(function()
+        S.Range = math.clamp(S.Range - 50, 50, 1000)
+        r()
+    end)
+    plus.Activated:Connect(function()
+        S.Range = math.clamp(S.Range + 50, 50, 1000)
+        r()
+    end)
+end
+
+local collapsed = false
+minBtn.Activated:Connect(function()
+    collapsed = not collapsed
+    body.Visible = not collapsed
+    panel.Size = collapsed and UDim2.fromOffset(190, 28) or UDim2.fromOffset(190, 260)
+    minBtn.Text = collapsed and "+" or "-"
+end)
+
+lockBtn.Activated:Connect(function()
+    S.Locked = not S.Locked
+    lockBtn.Text = S.Locked and "🔒" or "🔓"
+    lockBtn.BackgroundColor3 = S.Locked and Color3.fromRGB(170, 40, 40) or C_OFF
+end)
+
+local function isPointer(i, moveType)
+    local t = i.UserInputType
+    return t == Enum.UserInputType.Touch or t == moveType
+end
+
+local dragging, dragStart, startPos = false, nil, nil
+title.InputBegan:Connect(function(i)
+    if S.Locked or not isPointer(i, Enum.UserInputType.MouseButton1) then return end
+    dragging = true
+    dragStart = i.Position
+    startPos = panel.Position
+    i.Changed:Connect(function()
+        if i.UserInputState == Enum.UserInputState.End then dragging = false end
+    end)
+end)
+
+table.insert(conns, UIS.InputChanged:Connect(function(i)
+    if not dragging then return end
+    if S.Locked then
+        dragging = false
+        return
+    end
+    if isPointer(i, Enum.UserInputType.MouseMovement) then
+        local d = i.Position - dragStart
+        panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end))
+
+env.__MobHubCleanup = function()
+    stopESP()
+    if S.NV then setNV(false) end
+    for _, c in ipairs(conns) do c:Disconnect() end
+    hub:Destroy()
+    layer:Destroy()
+end
