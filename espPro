@@ -1,0 +1,413 @@
+local env = (getgenv and getgenv()) or _G
+if env.ESP_UNLOAD then pcall(env.ESP_UNLOAD) end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+
+-- ===== CẤU HÌNH =====
+local CFG = {
+    Ver = 2,
+    Enabled = true,
+    Glow = true,
+    Beam = true,
+    Name = true,
+    TeamCheck = false,
+    TeamColor = true,
+    MaxDistance = 1000,
+    MaxGlow = 30,
+    Fill = 0.5,
+    BeamWidth = 0.1,
+    Rate = 0.1,
+    Color = Color3.fromRGB(255, 60, 60), -- màu mặc định khi không có đội
+}
+-- Giữ cài đặt cũ khi chạy lại (chỉ khi cùng phiên bản)
+if type(env.ESP_CFG) == "table" and env.ESP_CFG.Ver == CFG.Ver then
+    for k, v in pairs(env.ESP_CFG) do
+        if CFG[k] ~= nil and typeof(v) == typeof(CFG[k]) then CFG[k] = v end
+    end
+end
+env.ESP_CFG = CFG
+
+local function rname() return tostring(math.random(100000, 999999)) end
+local root = (gethui and gethui()) or game:GetService("CoreGui")
+local holder = Instance.new("Folder")
+holder.Name = rname()
+holder.Parent = root
+
+local data, pconns, conns = {}, {}, {}
+local localAtt
+local function connect(sig, fn)
+    local c = sig:Connect(fn)
+    conns[#conns + 1] = c
+    return c
+end
+
+-- ===== ĐỐI TƯỢNG =====
+local function destroy(plr)
+    local d = data[plr]
+    if not d then return end
+    data[plr] = nil
+    d.hl:Destroy(); d.ta:Destroy(); d.beam:Destroy(); d.bb:Destroy()
+end
+
+local function makeLabel(parent, y, h, size, trans)
+    local lb = Instance.new("TextLabel")
+    lb.BackgroundTransparency = 1
+    lb.Position = UDim2.fromScale(0, y)
+    lb.Size = UDim2.fromScale(1, h)
+    lb.Font = Enum.Font.Gotham
+    lb.TextSize = size
+    lb.TextTransparency = trans
+    lb.TextStrokeTransparency = 0.6
+    lb.TextStrokeColor3 = Color3.new(0, 0, 0)
+    lb.Parent = parent
+    return lb
+end
+
+local function build(plr)
+    destroy(plr)
+    local char = plr.Character
+    if not char then return end
+    local hrp = char:WaitForChild("HumanoidRootPart", 5)
+    if not hrp or plr.Character ~= char then return end
+    destroy(plr)
+
+    local hl = Instance.new("Highlight")
+    hl.Name = rname()
+    hl.OutlineColor = Color3.new(1, 1, 1)
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Adornee = char
+    hl.Enabled = false
+    hl.Parent = holder
+
+    local ta = Instance.new("Attachment")
+    ta.Name = rname()
+    ta.Parent = hrp
+
+    local beam = Instance.new("Beam")
+    beam.Name = rname()
+    beam.Attachment1 = ta
+    beam.FaceCamera = true
+    beam.LightEmission = 1
+    beam.Transparency = NumberSequence.new(0.2)
+    beam.Enabled = false
+    beam.Parent = hrp -- Beam phải nằm trong Workspace mới hiển thị
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = rname()
+    bb.Adornee = hrp
+    bb.AlwaysOnTop = true
+    bb.Size = UDim2.fromOffset(160, 30)
+    bb.StudsOffset = Vector3.new(0, 3.5, 0)
+    bb.Enabled = false
+    bb.Parent = holder
+
+    local same = plr.DisplayName == plr.Name
+    local l1 = makeLabel(bb, 0, same and 1 or 0.55, 12, 0)
+    l1.Text = plr.DisplayName
+    local l2
+    if not same then
+        l2 = makeLabel(bb, 0.55, 0.45, 10, 0.2)
+        l2.Text = "@" .. plr.Name
+    end
+
+    data[plr] = {
+        hl = hl, ta = ta, beam = beam, bb = bb, l1 = l1, l2 = l2,
+        hrp = hrp, hum = char:FindFirstChildOfClass("Humanoid"),
+    }
+end
+
+local function getLocalAttachment()
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    if not localAtt or localAtt.Parent ~= hrp then
+        localAtt = Instance.new("Attachment")
+        localAtt.Name = rname()
+        localAtt.Parent = hrp
+    end
+    return localAtt, hrp
+end
+
+-- ===== CẬP NHẬT =====
+local hidden = false
+local function hideAll()
+    for _, d in pairs(data) do
+        d.hl.Enabled = false; d.beam.Enabled = false; d.bb.Enabled = false
+    end
+end
+
+local list = {}
+local function byDist(a, b) return a.dist < b.dist end
+
+local function update()
+    if not CFG.Enabled then
+        if not hidden then hideAll(); hidden = true end
+        return
+    end
+    hidden = false
+
+    local la, myHrp = getLocalAttachment()
+    if not myHrp then hideAll(); return end
+    local myPos = myHrp.Position
+    local n = 0
+    table.clear(list)
+
+    for plr, d in pairs(data) do
+        if not d.hrp.Parent then
+            destroy(plr)
+        else
+            local dist = (d.hrp.Position - myPos).Magnitude
+            local show = dist <= CFG.MaxDistance
+                and (not d.hum or d.hum.Health > 0)
+            if show and CFG.TeamCheck and plr.Team and plr.Team == lp.Team then
+                show = false
+            end
+            local col = (CFG.TeamColor and plr.Team) and plr.TeamColor.Color or CFG.Color
+
+            -- Tia
+            local beamOn = show and CFG.Beam
+            if beamOn then
+                if d.a0 ~= la then d.beam.Attachment0 = la; d.a0 = la end
+                if d.bcol ~= col then
+                    d.beam.Color = ColorSequence.new(col); d.bcol = col
+                end
+                if d.bw ~= CFG.BeamWidth then
+                    d.beam.Width0 = CFG.BeamWidth; d.beam.Width1 = CFG.BeamWidth
+                    d.bw = CFG.BeamWidth
+                end
+            end
+            if d.beam.Enabled ~= beamOn then d.beam.Enabled = beamOn end
+
+            -- Tên (màu theo đội)
+            local labelOn = show and CFG.Name
+            if labelOn and d.lcol ~= col then
+                d.l1.TextColor3 = col
+                if d.l2 then d.l2.TextColor3 = col end
+                d.lcol = col
+            end
+            if d.bb.Enabled ~= labelOn then d.bb.Enabled = labelOn end
+
+            -- Glow: chọn người gần nhất
+            if show and CFG.Glow then
+                n += 1
+                list[n] = d
+                d.dist = dist
+                d.gcol = col
+            elseif d.hl.Enabled then
+                d.hl.Enabled = false
+            end
+        end
+    end
+
+    table.sort(list, byDist)
+    for i = 1, n do
+        local d = list[i]
+        local on = i <= CFG.MaxGlow
+        if on then
+            if d.hl.FillColor ~= d.gcol then d.hl.FillColor = d.gcol end
+            if d.hl.FillTransparency ~= CFG.Fill then d.hl.FillTransparency = CFG.Fill end
+        end
+        if d.hl.Enabled ~= on then d.hl.Enabled = on end
+    end
+end
+
+local acc = 0
+connect(RunService.Heartbeat, function(dt)
+    acc += dt
+    if acc >= CFG.Rate then
+        acc = 0
+        pcall(update)
+    end
+end)
+
+-- ===== THEO DÕI NGƯỜI CHƠI =====
+local function watch(plr)
+    if plr == lp then return end
+    local c = {}
+    pconns[plr] = c
+    c[1] = plr.CharacterAdded:Connect(function() task.spawn(build, plr) end)
+    c[2] = plr.CharacterRemoving:Connect(function() destroy(plr) end)
+    if plr.Character then task.spawn(build, plr) end
+end
+
+local function unwatch(plr)
+    destroy(plr)
+    local c = pconns[plr]
+    if c then
+        for _, x in ipairs(c) do x:Disconnect() end
+        pconns[plr] = nil
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do watch(p) end
+connect(Players.PlayerAdded, watch)
+connect(Players.PlayerRemoving, unwatch)
+
+-- ===== MENU CẢM ỨNG =====
+local gui = Instance.new("ScreenGui")
+gui.Name = rname()
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = root
+
+local W_OPEN, W_CLOSED = 170, 44
+local state = {open = true, locked = false}
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(W_OPEN, 0)
+frame.AutomaticSize = Enum.AutomaticSize.Y
+frame.Position = UDim2.new(0, 10, 0.3, 0)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.BackgroundTransparency = 0.1
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+local layout = Instance.new("UIListLayout", frame)
+layout.Padding = UDim.new(0, 4)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+local pad = Instance.new("UIPadding", frame)
+pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 6), UDim.new(0, 6)
+
+local function btn(text, order, parent)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, 30)
+    b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 13
+    b.Text = text
+    b.LayoutOrder = order
+    b.Parent = parent or frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local function place(x, y)
+    local vp, fs = gui.AbsoluteSize, frame.AbsoluteSize
+    frame.Position = UDim2.fromOffset(
+        math.clamp(x, 0, math.max(0, vp.X - fs.X)),
+        math.clamp(y, 0, math.max(0, vp.Y - fs.Y))
+    )
+end
+local function reclamp() place(frame.AbsolutePosition.X, frame.AbsolutePosition.Y) end
+connect(frame:GetPropertyChangedSignal("AbsoluteSize"), reclamp)
+connect(gui:GetPropertyChangedSignal("AbsoluteSize"), reclamp)
+
+local headRow = Instance.new("Frame")
+headRow.Size = UDim2.new(1, 0, 0, 30)
+headRow.BackgroundTransparency = 1
+headRow.LayoutOrder = 0
+headRow.Parent = frame
+
+local head = btn("≡ ESP", 0, headRow)
+head.Size = UDim2.new(1, -34, 1, 0)
+head.TextSize = 12
+
+local lockBtn = btn("🔓", 0, headRow)
+lockBtn.Size = UDim2.fromOffset(30, 30)
+lockBtn.Position = UDim2.new(1, -30, 0, 0)
+lockBtn.TextSize = 15
+
+local dragInput, dragStart, startPos
+local moved = false
+head.InputBegan:Connect(function(i)
+    local t = i.UserInputType
+    if (t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1) and not dragInput then
+        dragInput, moved = i, false
+        dragStart = i.Position
+        startPos = frame.AbsolutePosition
+    end
+end)
+connect(UIS.InputChanged, function(i)
+    if not dragInput then return end
+    if i ~= dragInput and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local d = i.Position - dragStart
+    if d.Magnitude > 8 then moved = true end
+    if moved and not state.locked then
+        place(startPos.X + d.X, startPos.Y + d.Y)
+    end
+end)
+connect(UIS.InputEnded, function(i)
+    if dragInput and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
+        dragInput = nil
+    end
+end)
+
+local rows = {}
+local function toggle(label, key, order)
+    local b = btn("", order)
+    local function refresh()
+        b.Text = label .. ": " .. (CFG[key] and "BẬT" or "TẮT")
+        b.BackgroundColor3 = CFG[key] and Color3.fromRGB(40, 120, 70) or Color3.fromRGB(45, 45, 55)
+    end
+    b.Activated:Connect(function() CFG[key] = not CFG[key]; refresh() end)
+    refresh()
+    rows[#rows + 1] = b
+end
+
+local function cycle(label, key, values, fmt, order)
+    local b = btn("", order)
+    local idx, best = 1, math.huge
+    for i, v in ipairs(values) do
+        local df = math.abs(v - CFG[key])
+        if df < best then best, idx = df, i end
+    end
+    local function refresh()
+        CFG[key] = values[idx]
+        b.Text = label .. ": " .. string.format(fmt, values[idx]) .. " ›"
+    end
+    b.Activated:Connect(function() idx = idx % #values + 1; refresh() end)
+    refresh()
+    rows[#rows + 1] = b
+end
+
+toggle("ESP", "Enabled", 1)
+toggle("Glow", "Glow", 2)
+toggle("Tia", "Beam", 3)
+toggle("Tên", "Name", 4)
+toggle("Bỏ đồng đội", "TeamCheck", 5)
+toggle("Màu đội", "TeamColor", 6)
+cycle("Tầm xa", "MaxDistance", {250, 500, 1000, 2000, 3000}, "%d", 7)
+cycle("Độ đặc glow", "Fill", {0, 0.25, 0.5, 0.75, 1}, "%.2f", 8)
+cycle("Độ dày tia", "BeamWidth", {0.1, 0.2, 0.3, 0.5}, "%.1f", 9)
+cycle("Tốc độ cập nhật", "Rate", {0.05, 0.1, 0.2, 0.5}, "%.2fs", 10)
+
+local function setOpen(v)
+    state.open = v
+    for _, r in ipairs(rows) do r.Visible = v end
+    lockBtn.Visible = v
+    head.Text = v and "≡ ESP" or "🧿"
+    head.TextSize = v and 12 or 18
+    head.Size = v and UDim2.new(1, -34, 1, 0) or UDim2.new(1, 0, 1, 0)
+    frame.Size = UDim2.fromOffset(v and W_OPEN or W_CLOSED, 0)
+end
+
+head.Activated:Connect(function()
+    if moved then return end
+    setOpen(not state.open)
+end)
+
+lockBtn.Activated:Connect(function()
+    state.locked = not state.locked
+    lockBtn.Text = state.locked and "🔒" or "🔓"
+    lockBtn.BackgroundColor3 = state.locked and Color3.fromRGB(150, 50, 50) or Color3.fromRGB(45, 45, 55)
+end)
+
+setOpen(true)
+task.defer(reclamp)
+
+-- ===== GỠ SCRIPT =====
+env.ESP_UNLOAD = function()
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    for plr in pairs(pconns) do unwatch(plr) end
+    for plr in pairs(data) do destroy(plr) end
+    pcall(function() holder:Destroy() end)
+    pcall(function() gui:Destroy() end)
+    if localAtt then pcall(function() localAtt:Destroy() end) end
+    env.ESP_UNLOAD = nil
+end
